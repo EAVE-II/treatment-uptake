@@ -1,0 +1,677 @@
+---
+title: "ROCOVE Uptake Analysis"
+author: "Holly Tibble"
+output:
+  pdf_document: default
+---
+
+```{r setup, include=FALSE, echo=T}
+knitr::opts_chunk$set(eval = TRUE, echo = FALSE, message=F,warning=F)
+library(tidyverse)
+library(MetBrewer)
+library(caret)
+library(janitor)
+library(kableExtra)
+library(lubridate)
+library(survival)
+```
+
+
+```{r load_custom_data}
+# Read in LFT tests in case some tests were not PCR:
+LFT_extraction_date=as.Date("2022-06-06")
+lfts <-readRDS("data/lft_positives_060622.rds") %>%
+  mutate(date_ecoss_specimen = as.Date(date_ecoss_specimen)) %>%
+  filter(date_ecoss_specimen <= LFT_extraction_date)
+rm(LFT_extraction_date)
+
+# OPCS4 codes
+OPCS4<-readRDS("data/MAB_OPCS4_270922.rds") 
+min_OPCS4<-min(OPCS4$date_main_operation)
+
+# PIS Extract for Immunotherapies
+PIS<-readRDS("data/PIS_MAB_0802_2022-09-27.rds")
+
+# Treatment Data
+hepma <- readRDS("data/HEPMA_mABsAVs_admin_ 2022-10-11 .rds")
+hepma2<-readRDS("data/HEPMA_mABsAVs_prescr_ 2022-10-11 .rds")
+PHSO <- readRDS("data/MABs_2022-09-27.rds")
+
+```
+
+```{r load_data}
+### These are the datasets that are automatically refreshed
+
+setwd("/conf/EAVE/GPanalysis")
+
+#SMR01 (hospitalisations)
+SMR01<-readRDS("data/SMR01_allstays.rds")
+
+# Demographics
+demog<-readRDS("outputs/temp/Cohort_Demog_Endpoints_Dates2021-07-28.rds")
+
+# Q COVID Diagnoses
+Q<-readRDS("data/cleaned_data/QCOVID_feb22.rds")
+
+# PCR testing data
+cdw <- readRDS("data/CDW_full.rds")
+
+# Smoking data
+smoking <- readRDS("outputs/temp/CR_Cohort_RG_EAVE_BP_Smoke.rds")
+
+# Viral sequencing data
+sequencing<-readRDS("data/WGS_latest.rds") %>%
+  select(EAVE_LINKNO, Collection_Date, VariantShorthand, lineage) %>%
+  mutate(Collection_Date = as.Date(Collection_Date)) %>%
+  filter(!is.na(Collection_Date) &
+           Collection_Date >= as.Date("2021-12-01"))
+
+# load in hospitalisations data
+hosp <- readRDS("data/automated_any_hospitalisation_post_01022020.rds")
+
+# Vaccination Data
+vaccs <- readRDS("data/cleaned_data/C19vaccine_dvprod_cleaned.rds")
+
+```
+
+## Uptake by Treatment
+
+```{r setup2, warning=F}
+
+# Read in HEPMA Administration data
+hepma<-hepma %>%
+  mutate(Medication = str_to_title(drug_admin),
+         Treatment_Date = admin_given_date_time,
+         Treatment_Date=replace_na(scheduled_date)) %>%
+  select(EAVE_LINKNO,Medication,patient_HB,Treatment_Date) %>%
+  filter(!is.na(EAVE_LINKNO) & Medication!="Ronapreve")
+
+# Read in HEPMA Prescription data
+hepma2<-hepma2 %>%
+  mutate(Medication = str_to_title(drug_prescr),
+         Treatment_Date = prescr_date) %>%
+  select(EAVE_LINKNO,Medication,patient_HB,Treatment_Date) %>%
+  filter(!is.na(EAVE_LINKNO) & Medication!="Ronapreve")
+
+# Merge HEPMA datasets together
+hepma <- hepma %>%
+  bind_rows(hepma2) %>% 
+  distinct() %>%
+  filter(substr(patient_HB,1,3)=="NHS") %>%
+  mutate(health_board = str_to_title(substr(patient_HB,5,nchar(patient_HB)))) %>%
+  select(-patient_HB)
+
+hepma_max<-max(hepma$Treatment_Date)
+
+# Non-HEPMA data
+PHSO <- PHSO %>%
+  clean_names() %>%
+  filter(year(prescribed_date)>=2021) %>%
+  mutate(Medication = ifelse(str_detect(toupper(drug_prescribed),'SARILUMAB'),
+                             'Sarilumab',NA),
+         Medication = ifelse(str_detect(toupper(drug_prescribed),'TOCILIZUMAB'),
+                             'Tocilizumab',Medication),
+         Medication = ifelse(str_detect(toupper(drug_prescribed),'SOTROVIMAB'),
+                             'Sotrovimab',Medication),
+         Medication = ifelse(str_detect(toupper(drug_prescribed),'MOLNUPIRAVIR'),
+                             'Molnupiravir',Medication),
+         Medication = ifelse(str_detect(toupper(drug_prescribed),'MOLNUPAVIR'),
+                             'Molnupiravir',Medication),
+         Medication = ifelse(str_detect(toupper(drug_prescribed),'MOLNUPIRIVIR'),
+                             'Molnupiravir',Medication),
+         Medication = ifelse(str_detect(toupper(drug_prescribed),'LAGEVRIO'),
+                             'Molnupiravir',Medication),
+         Medication = ifelse(str_detect(toupper(drug_prescribed),'PAXLOVID'),
+                             'Paxlovid',Medication),
+         Medication = ifelse(str_detect(toupper(drug_prescribed),'REMDESIVIR'),
+                             'Remdesivir',Medication),
+         prescribed_date = if_else(prescribed_date<as.Date("2021-12-01"),
+                                   as.Date(prescribed_date + years(1)),
+                                   prescribed_date)) 
+sum(is.na(PHSO$Medication))
+PHSO <- PHSO %>% 
+  filter(!is.na(Medication)) %>%
+  rename(EAVE_LINKNO = eave_linkno,
+         Treatment_Date = prescribed_date) %>%
+  filter(!is.na(EAVE_LINKNO) &
+           Treatment_Date<=hepma_max) %>%
+  select(-dosage, -drug_prescribed,-healthcare_setting) %>%
+  distinct() %>%
+  mutate(health_board = ifelse(health_board=="Ayshire & Arran",
+                               "Ayrshire & Arran",health_board)) 
+
+PHSO_max<-max(PHSO$Treatment_Date)
+PHSO_end_dates <- PHSO %>%
+  group_by(health_board) %>%
+  summarise(censor_date = max(Treatment_Date))
+
+
+# Remove duplicated records across sources
+treated <- bind_rows(hepma, PHSO)  %>%
+  arrange(EAVE_LINKNO, Medication,Treatment_Date) %>%
+  group_by(EAVE_LINKNO, Medication,Treatment_Date) %>%
+  slice(1) %>%
+  ungroup
+
+# multiple records of the same trt, and episode - keep first by date 
+treated <- treated %>%
+  group_by(EAVE_LINKNO, Medication) %>%
+  arrange(EAVE_LINKNO, Medication,Treatment_Date) %>%
+  filter(!(n()>1 & row_number()>1)) %>%
+  # some people have cocktails
+  group_by(EAVE_LINKNO) %>%
+  mutate(cocktail  = length(unique(Medication))>1)
+
+cocktails<- treated %>%
+  filter(cocktail) %>%
+  group_by(EAVE_LINKNO) %>% 
+  arrange(Treatment_Date) %>%
+  summarise(cocktail_name = "Cocktail",
+            cocktail_dur = as.numeric(max(Treatment_Date)-min(Treatment_Date))) %>%
+  ungroup
+
+# then need to merge this back in to treated (with only first record per person-episode)
+treated <- treated  %>%
+  group_by(EAVE_LINKNO) %>%
+  arrange(EAVE_LINKNO, Treatment_Date) %>%
+  slice(1) %>%
+  ungroup   %>%
+  left_join(cocktails) %>%
+  mutate(Medication = ifelse(cocktail,cocktail_name,Medication)) %>%
+  select(-cocktail,-cocktail_name) 
+
+rm(hepma,hepma2,PHSO,cocktails)
+
+```
+
+
+```{r healthcare_setting}
+
+# SMR01 records - who was treated during an admission?
+hosp_treated<-SMR01 %>%
+  select(EAVE_LINKNO, ADMISSION_DATE, DISCHARGE_DATE,covid_main_diag_admit) %>%
+  inner_join(treated %>% select(EAVE_LINKNO, Treatment_Date))  %>%
+  filter(!(ADMISSION_DATE>Treatment_Date) &
+           !(DISCHARGE_DATE<Treatment_Date)) %>%
+  mutate(healthcare_setting_SMR = ifelse(covid_main_diag_admit==1,"1","2")) %>%
+  group_by(EAVE_LINKNO) %>%
+  arrange(EAVE_LINKNO,healthcare_setting_SMR) %>%
+  slice(1) %>%
+  ungroup()
+
+# who was treated during a currently uncoded admission   
+rapid_treated<-hosp %>%
+  select(EAVE_LINKNO,admission_date,discharge_date) %>%
+  filter(EAVE_LINKNO %in% treated$EAVE_LINKNO) %>%
+  left_join(treated %>% select(EAVE_LINKNO, Treatment_Date))  %>%
+  filter(!(admission_date>Treatment_Date) &
+           (!(discharge_date<Treatment_Date) |
+              is.na(discharge_date))) %>%
+  mutate(healthcare_setting_RAPID = "X")  %>%
+  group_by(EAVE_LINKNO) %>%
+  arrange(EAVE_LINKNO,admission_date) %>%
+  slice(1) %>%
+  ungroup()
+
+length(unique(treated$EAVE_LINKNO))
+
+# healthcare setting estimation
+treated<-treated %>%
+  left_join(hosp_treated %>% select(EAVE_LINKNO, healthcare_setting_SMR)) %>%
+  left_join(rapid_treated %>% select(EAVE_LINKNO, healthcare_setting_RAPID)) %>%
+  filter(is.na(healthcare_setting_SMR) & is.na(healthcare_setting_RAPID)) %>% # non-acute
+  filter(Medication %in%  c("Molnupiravir","Sotrovimab","Paxlovid","Cocktail")) %>%
+  select(-healthcare_setting_RAPID,-healthcare_setting_SMR) 
+
+rm(rapid_treated,hosp_treated)
+
+# total number treated in outpatient
+treated_IDS<-unique(treated$EAVE_LINKNO)
+
+```
+
+```{r time_to_trt}
+
+# Restrict testing extract to no earlier than 28 days before first treatment date:
+period_start <- min(treated$Treatment_Date)-28
+period_end<-max(treated$Treatment_Date)
+
+# PCR testing data 
+cdw_treated<- cdw %>% 
+  filter(test_result == "POSITIVE" & 
+           date_ecoss_specimen >= period_start & 
+           EAVE_LINKNO %in% treated$EAVE_LINKNO) %>% 
+  select(EAVE_LINKNO, date_ecoss_specimen) %>% 
+  mutate(test_type = "PCR",
+         date_ecoss_specimen = as.Date(date_ecoss_specimen))
+
+# Read in LFT tests in case some tests were not PCR:
+lfts_treated <- lfts %>% 
+  mutate(date_ecoss_specimen = as.Date(date_ecoss_specimen)) %>% 
+  select(EAVE_LINKNO, date_ecoss_specimen) %>% 
+  filter(EAVE_LINKNO %in% treated$EAVE_LINKNO & 
+           date_ecoss_specimen >= period_start) %>%
+  mutate(test_type = "LFT")
+
+# Diagnosed in hospital
+hosp_diag_treated<- SMR01 %>%
+  mutate(test_type = "HOSP",
+         date_ecoss_specimen=as.Date(ADMISSION_DATE)) %>%
+  filter(EAVE_LINKNO %in% treated$EAVE_LINKNO & 
+           date_ecoss_specimen>= period_start) %>%
+  gather("Condition","Code",
+         -EAVE_LINKNO,-CIS_MARKER,-ADMISSION_DATE,-DISCHARGE_DATE,
+         -test_type,-date_ecoss_specimen) %>%
+  filter(Code=="U071") %>%
+  distinct(EAVE_LINKNO, date_ecoss_specimen,test_type)
+
+# Join all together
+valid_tests <- left_join(treated %>% select(EAVE_LINKNO,Treatment_Date), 
+                         as.data.frame(bind_rows(cdw_treated, lfts_treated, hosp_diag_treated)))  %>%
+  filter(Treatment_Date>=date_ecoss_specimen & Treatment_Date<=date_ecoss_specimen+28) %>%
+  group_by(EAVE_LINKNO,test_type) %>%
+  slice(1) %>% ungroup %>%
+  arrange(EAVE_LINKNO,date_ecoss_specimen)  %>%
+  group_by(EAVE_LINKNO) %>%
+  mutate(first_positive_test = min(date_ecoss_specimen)) 
+
+treated<- treated %>%
+  left_join(valid_tests  %>%
+              distinct(EAVE_LINKNO,first_positive_test)) %>%
+  left_join(valid_tests  %>%
+              filter(is.na(test_type) | test_type!="LFT") %>%
+              group_by(EAVE_LINKNO) %>%
+              summarise(PCR_date = min(date_ecoss_specimen, na.rm = T))) %>%
+  ungroup %>% 
+  mutate(no_test = is.na(first_positive_test)*1,
+         first_positive_test = ifelse(is.na(first_positive_test),Treatment_Date,first_positive_test),
+         test_to_trt = as.numeric(Treatment_Date - PCR_date))
+class(treated$first_positive_test)<-"Date"
+
+rm(valid_tests,lfts,cdw_treated,lfts_treated,hosp_diag_treated)
+
+```
+
+Treatment records were available in HEPMA and PHSO up to `r max(hepma_max,PHSO_max)`, but with different dates per healthboard.  
+
+In total, there were `r length(treated_IDS)` patients identified treated in the outpatient setting (first treatment was pax, sot, or mol (or combo) while not in hospital.
+
+Of these, `r sum(treated$Medication=="Sotrovimab")` were treated with Sotrovimab (`r round(sum(treated$Medication=="Sotrovimab")*100/nrow(treated),1)`), `r sum(treated$Medication=="Molnupiravir")` with Molnupiravir (`r round(sum(treated$Medication=="Molnupiravir")*100/nrow(treated),1)`), `r sum(treated$Medication=="Paxlovid")` with Paxlovid (`r round(sum(treated$Medication=="Paxlovid")*100/nrow(treated),1)`), and `r sum(treated$Medication=="Cocktail")` with Cocktail (`r round(sum(treated$Medication=="Cocktail")*100/nrow(treated),1)`).
+
+Of those treated with a combination of therapies, `r sum(treated$Medication=="Cocktail" & treated$cocktail_dur==0)` (`r round(sum(treated$Medication=="Cocktail" & treated$cocktail_dur==0)*100/sum(treated$Medication=="Cocktail"),1)`%) were treated with all medications on the same day, `r sum(treated$Medication=="Cocktail" & treated$cocktail_dur>0 & treated$cocktail_dur<3)` (`r round(sum(treated$Medication=="Cocktail" & treated$cocktail_dur>0 & treated$cocktail_dur<3)*100/sum(treated$Medication=="Cocktail"),1)`%) over 2 or 3 days,  `r sum(treated$Medication=="Cocktail" & treated$cocktail_dur>=3 & treated$cocktail_dur<7)` (`r round(sum(treated$Medication=="Cocktail" & treated$cocktail_dur>=3 & treated$cocktail_dur<7)*100/sum(treated$Medication=="Cocktail"),1)`%) over 4 to 7 days, and `r sum(treated$Medication=="Cocktail" & treated$cocktail_dur>=7)` (`r round(sum(treated$Medication=="Cocktail" & treated$cocktail_dur>=7)*100/sum(treated$Medication=="Cocktail"),1)`%) more than a week apart. 
+
+```{r censor_date}
+PHSO_end_dates
+```
+
+
+```{r plot2}
+treated_wk<-treated %>% 
+  mutate(week = paste0(year(Treatment_Date),"_",
+                       strftime(Treatment_Date, format = "%V")),
+         week = ifelse(week %in% c("2022_52","2021_53"),
+                       "2022_01",week)) %>%
+  group_by(Medication) %>%
+  count(week,name="treated") %>%
+  group_by(week) %>%
+  mutate(week_total = sum(treated),
+         perc = treated*100/week_total, 
+         Medication = ifelse(Medication=="Paxlovid",
+                             "Paxlovid (Nirmatrelvir/Ritonavir)",
+                             Medication))
+
+ggplot(treated_wk) +
+  geom_bar(aes(x=week, y=perc,fill=Medication),
+           position = "stack",stat="identity") +
+  theme_bw() + ylab("Treatment Proportion by Week") + 
+  xlab("Week of Treatment Initiation") +
+  scale_fill_manual(values=c(met.brewer("Hiroshige",4),"black")) +
+  labs(fill = "Treatment Group") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 1, hjust=1))
+
+rm(treated_wk)
+```
+
+## Uptake by Demographics
+  
+
+```{r setup3}
+
+organ_codes<-c("C437","C467","E538","E539","F081","F082","J011",
+               "J012","J013","J015","J541","J542","J544","J549",
+               "J551","J552","J553","J559","J721","K021","K022",
+               "K026","K029","M011","M012","M013","M014","M015",
+               "M018","M019","M026","M027","M084","M171","M172",
+               "M173","M175","M178","M179","T501","T509","T761",
+               "T768", "T769")
+
+radiotherapy_codes<-c("X654","X653","X652","X651","X656","X657",
+                      "C823","M712","P205","Y361","Y352","Y351",
+                      "Y354","Y353","Q151","Y914","Y911","Y915",
+                      "Y912", "X655","Y918", "Y368", "Y358","X658",
+                      "C824","M706","Y363","X651", "X652", "X653",
+                      "X654", "X655", "X656","X657", "X658", "X659",
+                      "C395","A613","J123","Y913","Y919","Y369",
+                      "Y359","X659")
+
+#OPCS4 Codes
+OPCS4<-OPCS4  %>%
+  # split out multiple codes
+  mutate(main_operation2 = ifelse(nchar(main_operation)==8,
+                                  substr(main_operation,5,8),
+                                  NA),
+         main_operation = ifelse(nchar(main_operation)==8,
+                                 substr(main_operation,1,4),
+                                 main_operation)) %>%
+  gather("operation","code",-EAVE_LINKNO,-date_main_operation) %>%
+  select(-operation) %>%
+  filter(!is.na(code)) %>%
+  # most recent of each code per person
+  group_by(EAVE_LINKNO,code) %>%
+  arrange(EAVE_LINKNO,code,rev(date_main_operation)) %>%
+  slice(1) %>%
+  ungroup() %>%
+  # split code per group (radiotherapy etc.)
+  mutate(code_category = case_when(code %in% c("J699","J709") ~  "splenectomy",
+                                   substr(code,1,3)=="W34" ~ "bone_marrow_transplant",
+                                   code %in% c("W715","W893","X334","X335","X336") ~ "stem_cell_transplant",
+                                   code=="E852" ~ "non_invasive_ventilation",
+                                   substr(code,1,3) %in% c("X70","X71","X72","X73") ~  "chemotherapy",
+                                   code %in% organ_codes ~ "solid_organ_transplant",
+                                   code %in% radiotherapy_codes ~ "radiotherapy")) %>%
+  filter(!is.na(code_category)) %>%
+  distinct(EAVE_LINKNO,code_category) %>%
+  mutate(value = 1) %>%
+  spread(code_category,value) %>%
+  gather(code_category,value,-EAVE_LINKNO) %>%
+  mutate(value = replace_na(value,0)) %>%
+  spread(code_category,value)
+
+# Immune Drugs (BNF 0802)
+immune<-PIS %>%
+  filter(EAVE_LINKNO %in% treated$EAVE_LINKNO) %>%
+   distinct(EAVE_LINKNO) %>%
+  mutate(immune_PIS = 1)
+
+# Organ Transplant complications data for treated
+organ<-SMR01 %>%
+  filter(substr(Main_diag_admit,1,3)=="T86" & 
+           EAVE_LINKNO %in% treated$EAVE_LINKNO) %>%
+  distinct(EAVE_LINKNO) %>%
+  mutate(transplant_SMR01 = 1)
+
+# QCOVID data for treated 
+Q_treated<-treated  %>%
+  select(EAVE_LINKNO) %>%
+  left_join(Q %>%
+              filter(EAVE_LINKNO %in% treated$EAVE_LINKNO) %>%
+              mutate(Q_DIAG_CKD = Q_DIAG_CKD_LEVEL>=3,
+                     Q_DOWNS = (Q_LEARN_CAT==2)*1) %>%
+              select(EAVE_LINKNO, Q_DOWNS, Q_BMI, Q_DIAG_CKD, Q_DIAG_BLOOD_CANCER,
+                     Q_DIAG_CIRRHOSIS, Q_DIAG_HIV_AIDS, Q_DIAG_IMMU, Q_DIAG_NEURO, 
+                     Q_DIAG_RA_SLE, Q_DIAG_RESP_CANCER, Q_DIAG_SICKLE_CELL)) %>% 
+  mutate(Q_BMI = ifelse(is.na(Q_BMI) | as.numeric(Q_BMI)>70 | as.numeric(Q_BMI)<5,
+                        NA,as.numeric(Q_BMI))) %>%
+  left_join(organ) %>%
+  left_join(OPCS4) %>%
+  left_join(immune) %>%
+  mutate(Q_DIAG_IMMU = ifelse(Q_DIAG_IMMU==1 | immune_PIS==1,1,0),
+         transplant = ifelse(!is.na(solid_organ_transplant) | !is.na(transplant_SMR01),1,0)) %>%
+  select(-solid_organ_transplant,-transplant_SMR01,-immune_PIS,-non_invasive_ventilation) %>%
+  gather("cat","value",-EAVE_LINKNO,-Q_BMI) %>%
+  group_by(EAVE_LINKNO)  %>%
+  mutate(value = ifelse(is.na(value),0,as.numeric(value)),
+         QSUM = sum(value)) %>%
+  spread(cat,value)
+
+treated<-treated  %>% left_join(Q_treated)
+rm(Q_treated, organ)
+
+controls<- cdw %>% 
+  filter(test_result == "POSITIVE" & 
+           date_ecoss_specimen >= period_start & 
+           date_ecoss_specimen < (period_end-14) &
+           !EAVE_LINKNO %in% treated_IDS &
+           flag_covid_symptomatic == "true") %>% 
+  mutate(first_positive_test = as.Date(date_ecoss_specimen),
+         health_board = str_remove(str_to_title(HB_residence),"Nhs ")) %>%
+  select(EAVE_LINKNO, first_positive_test,health_board) %>% 
+  group_by(EAVE_LINKNO) %>%
+  arrange(EAVE_LINKNO, first_positive_test) %>%
+  slice(1) %>%
+  ungroup
+rm(treated_IDS)
+
+#censor dates variable by healthboard
+controls<-left_join(controls, PHSO_end_dates) %>%
+  filter(is.na(censor_date) |
+           first_positive_test < (censor_date-14))
+
+# elligibility
+organ_controls<-SMR01 %>%
+  filter(substr(Main_diag_admit,1,3)=="T86" & 
+           EAVE_LINKNO %in% controls$EAVE_LINKNO) %>%
+  distinct(EAVE_LINKNO) %>%
+  mutate(transplant_SMR01 = 1)
+
+# Immune Drugs (BNF 0802)
+immune_control<-PIS %>%
+  filter(EAVE_LINKNO %in% controls$EAVE_LINKNO) %>%
+   distinct(EAVE_LINKNO) %>%
+  mutate(immune_PIS = 1)
+
+Q_controls<-controls  %>%
+  select(EAVE_LINKNO) %>%
+  inner_join(Q %>%
+               filter(EAVE_LINKNO %in% controls$EAVE_LINKNO) %>%
+               mutate(Q_DIAG_CKD = Q_DIAG_CKD_LEVEL>=3,
+                     Q_DOWNS = (Q_LEARN_CAT==2)*1) %>%
+               select(EAVE_LINKNO, Q_DOWNS,Q_BMI, Q_DIAG_CKD, Q_DIAG_BLOOD_CANCER,
+                      Q_DIAG_CIRRHOSIS, Q_DIAG_HIV_AIDS, Q_DIAG_IMMU, Q_DIAG_NEURO, 
+                      Q_DIAG_RA_SLE, Q_DIAG_RESP_CANCER, Q_DIAG_SICKLE_CELL)) %>% 
+  mutate(Q_BMI = ifelse(is.na(Q_BMI) | as.numeric(Q_BMI)>70 | as.numeric(Q_BMI)<5,
+                        NA,as.numeric(Q_BMI))) %>% 
+  left_join(organ_controls) %>%
+  left_join(OPCS4) %>%
+  left_join(immune_control) %>%
+  mutate(Q_DIAG_IMMU = ifelse(Q_DIAG_IMMU==1 | immune_PIS==1,1,0),
+         transplant = ifelse(!is.na(solid_organ_transplant) | !is.na(transplant_SMR01),1,0)) %>%
+  select(-solid_organ_transplant,-transplant_SMR01,-immune_PIS,-non_invasive_ventilation) %>%
+  gather("cat","value",-EAVE_LINKNO,-Q_BMI) %>%
+  group_by(EAVE_LINKNO) %>%
+  mutate(value = ifelse(is.na(value),0,as.numeric(value)),
+         QSUM = sum(value)) %>%
+  spread(cat,value) %>%
+  filter(QSUM>0)
+controls<-controls %>% inner_join(Q_controls) 
+rm(Q_controls,organ_controls,Q,immune_control,immune,organ_codes,OPCS4,radiotherapy_codes,SMR01)
+
+cohort<-treated %>% 
+  bind_rows(controls) %>%
+  mutate(treated = ifelse(is.na(Medication),0,1),
+         Medication = replace_na(Medication,"Untreated")) %>%
+  left_join(demog %>% 
+              select(EAVE_LINKNO, ageYear, Sex, simd2020_sc_quintile, ur6_2016_name)) 
+
+
+# Try to fill in missing demographic data from PCR testing records:
+cohort_cdw_demog <- left_join(cohort %>% select(EAVE_LINKNO,PCR_date,first_positive_test), 
+                              cdw %>%
+                                select(EAVE_LINKNO, age, subject_sex, simd2020v2_sc_quintile, 
+                                       ur6_2016,HB_residence,date_ecoss_specimen) %>% 
+                                filter(EAVE_LINKNO %in% cohort$EAVE_LINKNO)) %>%
+  filter(date_ecoss_specimen<=PCR_date | 
+           date_ecoss_specimen<=first_positive_test) %>%
+  group_by(EAVE_LINKNO) %>%
+  arrange(EAVE_LINKNO,date_ecoss_specimen) %>%
+  slice(n()) %>%
+  rename(sex = subject_sex,
+         simd = simd2020v2_sc_quintile,
+         ur6 = ur6_2016) %>%
+  mutate(simd = as.numeric(simd)) %>%
+  select(-date_ecoss_specimen) 
+
+cohort <- left_join(cohort, cohort_cdw_demog) %>% 
+  mutate(Sex = if_else(is.na(Sex),sex,Sex),
+         ageYear = if_else(is.na(ageYear),age,ageYear),  
+         simd2020_sc_quintile = if_else(is.na(simd2020_sc_quintile),
+                                        simd,as.numeric(simd2020_sc_quintile)),
+         simd2020_sc_quintile = ifelse(simd2020_sc_quintile==1,"1 (Most Deprived)",
+                                       ifelse(simd2020_sc_quintile==5,"5 (Least Deprived)",
+                                       as.character(simd2020_sc_quintile))),
+         ur6_2016_name = if_else(is.na(ur6_2016_name),ur6,
+                                 as.integer(substr(ur6_2016_name,1,1))),
+         ur6_2016_name = case_when(ur6_2016_name==1 ~ "1 (Large Urban Areas)",
+                                   ur6_2016_name==2 ~ "2 (Other Urban Areas)",
+                                   ur6_2016_name==3 ~ "3 (Accessible Small Towns)",
+                                   ur6_2016_name==4 ~ "4 (Remote Small Towns)",
+                                   ur6_2016_name==5 ~ "5 (Accessible Rural Areas)",
+                                   ur6_2016_name==6 ~ "6 (Remote Rural Areas)",
+                                   is.na(ur6_2016_name) ~ "Missing"),
+         age_gp = cut(ageYear,
+                      breaks = c(0, 11,18, 29, 39, 49, 59, 69, 79, 89, 100),
+                      labels = c("0-11","12-18", "19-29", "30-39", "40-49",
+                                 "50-59", "60-69", "70-79", "80-89", "90+")),
+         Sex = case_when(Sex == "F" | Sex == "Female" ~ "F",
+                         Sex == "M" | Sex == "Male" ~ "M")) %>%
+  select(-c(age:ur6,ageYear,HB_residence)) %>%
+  filter(!health_board %in% c("England/Wales/Northern Ireland",
+                              "Greater Glasgow") &
+           !(is.na(health_board)))
+
+rm(demog, hepma_max, PHSO_max, controls)
+
+# Previous Positive Test data for Cohort 
+prev_covid <- cohort %>%
+  select(EAVE_LINKNO,first_positive_test, Treatment_Date) %>%
+  left_join(cdw %>% 
+              filter(test_result == "POSITIVE" & 
+                       EAVE_LINKNO %in% cohort$EAVE_LINKNO) %>% 
+              mutate(last_infection = as.Date(date_ecoss_specimen)) %>%
+              select(EAVE_LINKNO, last_infection)) %>%
+  mutate(reference_date = min(Treatment_Date,first_positive_test, na.rm=T)) %>%
+  filter((last_infection+30) < reference_date) %>%
+  group_by(EAVE_LINKNO) %>%
+  arrange(EAVE_LINKNO, last_infection) %>%
+  slice(n()) %>%
+  mutate(temp= as.numeric(reference_date-last_infection),
+         last_infection_cat = case_when(temp<=60 ~ "31-60 days prior to index",
+                                        temp <= 120 ~ "61-120 days prior to index",
+                                        temp <=240 ~ "121-240 days prior to index", 
+                                        temp <= 480 ~ "241-480 days prior to index",
+                                        temp>480 ~ "481+ days prior to index")) %>%
+  select(EAVE_LINKNO, last_infection_cat)
+cohort<-cohort %>% left_join(prev_covid) %>%
+  mutate(last_infection_cat = replace_na(last_infection_cat, "No prior infections"))
+rm(prev_covid,cdw,cohort_cdw_demog)
+
+smoking <- smoking %>%
+  distinct(EAVE_LINKNO, EAVE_Smoking_Status_Worst) %>%
+  filter(EAVE_LINKNO %in% cohort$EAVE_LINKNO )
+cohort<-cohort %>% left_join(smoking) %>%
+  mutate(EAVE_Smoking_Status_Worst = replace_na(EAVE_Smoking_Status_Worst, "Unknown"))
+rm(smoking)
+
+# Sequencing record - FIRST within 4 weeks of PCR
+sequencing_cohort<-cohort %>%
+  select(EAVE_LINKNO, first_positive_test) %>%
+  filter(!is.na(first_positive_test)) %>%
+  left_join(sequencing) %>%
+  filter(Collection_Date>=first_positive_test & 
+           Collection_Date<=first_positive_test+28) %>%
+  group_by(EAVE_LINKNO) %>%
+  slice(1) %>%
+  select(-Collection_Date,-lineage)
+cohort <- cohort %>% left_join(sequencing_cohort) %>%
+  mutate(VariantShorthand = ifelse(is.na(VariantShorthand) | VariantShorthand=="NA",
+                                   "Unsequenced",
+                                   ifelse(VariantShorthand %in% c("B.1.1.529","BA.1"),
+                                          "B.1.1.529 / BA.1",
+                                          VariantShorthand)))
+rm(sequencing,sequencing_cohort)
+
+vaccs_cohort<- vaccs %>% 
+  filter(EAVE_LINKNO %in% cohort$EAVE_LINKNO) %>%
+  left_join(cohort %>% select(EAVE_LINKNO,first_positive_test)) %>%
+  filter(vacc_occurence_date<=first_positive_test) %>%
+  group_by(EAVE_LINKNO) %>%
+  summarise(vaccines = as.character(max(vacc_dose_number)))
+cohort<-  left_join(cohort,vaccs_cohort) %>%
+  mutate(vaccines = replace_na(vaccines,"Unvaccinated"))
+rm(vaccs,vaccs_cohort)
+
+```
+
+There were `r nrow(cohort)` people identified who met the eligibility criteria, and were thus included in the denominator for subsequent analyses:
+
+1. They had a positive PCR test between `r period_start` and a fortnight prior to the first treatment date and a fortnight prior to the last treatment date available for that health board,
+
+2. They self-reported as symptomatic when booking the PCR test, 
+
+3. They met at least one of the diagnostic criteria:
+
+History of transplant was flagged by any previous hospitalisation record with primary cause recorded as any ICD10 code under the parent "T86", for complications from transplant, or with OPCS-4 codes for solid organ transplants after `r min_OPCS4`. 
+
+QCovid3 category for Immunologic conditions was supplemented with any records of prescriptions from BNF chapter 08.02 (Drugs affecting the immune response) since`r min(PIS$prescribed_full_date)`. 
+
+Overall, `r round(nrow(treated)*100/nrow(cohort))`% of our elligible population were treated in the outpatient setting. 
+
+
+``` {r demog}
+rm(min_OPCS4,PIS,period_start,period_end)
+
+temp<-cohort %>% 
+  ungroup %>%
+  select(treated, health_board, ur6_2016_name, Sex, 
+         simd2020_sc_quintile, age_gp, last_infection_cat,
+         EAVE_Smoking_Status_Worst,VariantShorthand,vaccines,
+         bone_marrow_transplant, chemotherapy,  
+         Q_DIAG_BLOOD_CANCER, Q_DIAG_CIRRHOSIS, Q_DIAG_CKD, 
+         Q_DIAG_HIV_AIDS, Q_DIAG_IMMU, Q_DIAG_NEURO, Q_DIAG_RA_SLE, 
+         Q_DIAG_RESP_CANCER, Q_DIAG_SICKLE_CELL, Q_DOWNS, radiotherapy, 
+         splenectomy, stem_cell_transplant, transplant) %>%
+    #some combination to prevent small numbers
+    mutate(health_board = ifelse(health_board %in% c("Orkney","Shetland"),
+                                 "Orkney and Shetland",
+                                 health_board),
+           VariantShorthand = ifelse(!VariantShorthand %in% c("AY.4.2","B.1.1.529 / BA.1","B.1.617.2",
+                                                              "BA.2","BA.4", "BA.5"),
+                                     "Unsequenced/Other",VariantShorthand),
+           vaccines = ifelse(vaccines %in% c("5","6"), "5+", vaccines)) %>%
+  gather("variable","level", -treated) %>%
+  group_by(variable, level) %>%
+  summarise(total = n(),
+            n_treated = sum(treated==1)) %>%
+  mutate(level = ifelse(is.na(level),"Missing",level),
+         perc = ifelse(n_treated<5,
+                       ifelse(level=="Missing",
+                              " (<0.1%)",
+                              ""),
+                       paste0(" (",round(n_treated*100/total,1),"%)")),
+         label = ifelse(n_treated<5,
+                        paste0("<5/",total,perc),
+                        paste0(n_treated,"/",total,perc))) %>%
+  select(variable, level, label)
+  
+knitr::kable(temp, booktabs=F) %>%
+  kable_styling(latex_options = c("striped","hold_position")) 
+rm(temp)
+
+```
+
+```{r test_to_trt}
+
+sum(treated$test_to_trt<=5,na.rm=T)*100/sum(!is.na(treated$test_to_trt))
+
+treated %>% group_by(Medication) %>% 
+  summarise(missing_p = round(sum(is.na(test_to_trt)*100/n()),1),
+            median = median(test_to_trt, na.rm=T),
+            p25 = round(quantile(test_to_trt, prob=0.25,na.rm=T)),
+            p75= round(quantile(test_to_trt, prob=0.75,na.rm=T)),
+            p99 = round(quantile(test_to_trt, prob=0.99,na.rm=T)),
+            max = max(test_to_trt, na.rm=T))
+
+sum(treated$QSUM==0)*100/nrow(treated)
+
+```
+
