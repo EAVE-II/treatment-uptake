@@ -1,11 +1,16 @@
 ---
-title: "ROCOVE Uptake Analysis"
-author: "Holly Tibble"
 output:
   pdf_document: default
 ---
 
 ```{r setup, include=FALSE, echo=T}
+######################################################################
+## Title: Uptake of monoclonal antibodies and antiviral therapies for COVID-19 in Scotland
+## DOI: 10.1016/S0140-6736(22)02398-4
+## Code author: Dr Holly Tibble (htibble@ed.ac.uk)
+## Description: Linking together treatment data and identifying the full cohort of people eligible for treatment after diagnosis with Covid-19/
+######################################################################
+
 knitr::opts_chunk$set(eval = TRUE, echo = FALSE, message=F,warning=F)
 library(tidyverse)
 library(MetBrewer)
